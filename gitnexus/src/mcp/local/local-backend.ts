@@ -44,6 +44,177 @@ const VALID_NODE_LABELS = new Set([
   'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module',
 ]);
 
+type ChangeType = 'Modified' | 'Added' | 'Deleted' | 'Renamed';
+
+interface DiffLineRange {
+  start: number;
+  end: number;
+}
+
+interface DiffHunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+}
+
+interface ChangedFileInfo {
+  filePath: string;
+  oldPath?: string;
+  newPath?: string;
+  changeType: ChangeType;
+  ranges: DiffLineRange[];
+  hunks: DiffHunk[];
+}
+
+const HUNK_HEADER_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+function normalizeDiffPath(rawPath: string): string {
+  let p = rawPath.trim();
+  if (!p || p === '/dev/null') return '';
+
+  if ((p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
+    p = p.slice(1, -1)
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, '\\');
+  }
+
+  if (p.startsWith('a/') || p.startsWith('b/')) {
+    p = p.slice(2);
+  }
+
+  return p.replace(/\\/g, '/');
+}
+
+function mergeRanges(ranges: DiffLineRange[]): DiffLineRange[] {
+  if (ranges.length <= 1) return ranges;
+
+  const sorted = [...ranges].sort((a, b) => a.start - b.start);
+  const merged: DiffLineRange[] = [sorted[0]];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const cur = sorted[i];
+    const last = merged[merged.length - 1];
+    if (cur.start <= last.end + 1) {
+      last.end = Math.max(last.end, cur.end);
+    } else {
+      merged.push({ ...cur });
+    }
+  }
+
+  return merged;
+}
+
+function rangesOverlap(start: number, end: number, ranges: DiffLineRange[]): boolean {
+  if (ranges.length === 0) return false;
+  return ranges.some((r) => start <= r.end && end >= r.start);
+}
+
+function parseDiffOutput(diffText: string): ChangedFileInfo[] {
+  const changes: ChangedFileInfo[] = [];
+  const lines = diffText.split('\n');
+  let current: ChangedFileInfo | null = null;
+
+  const flushCurrent = () => {
+    if (!current) return;
+
+    const normalizedOld = current.oldPath ? normalizeDiffPath(current.oldPath) : '';
+    const normalizedNew = current.newPath ? normalizeDiffPath(current.newPath) : '';
+    const normalizedPrimary = normalizeDiffPath(
+      current.changeType === 'Deleted'
+        ? (current.oldPath || current.filePath || current.newPath || '')
+        : (current.newPath || current.filePath || current.oldPath || '')
+    );
+
+    if (normalizedPrimary) {
+      changes.push({
+        filePath: normalizedPrimary,
+        oldPath: normalizedOld || undefined,
+        newPath: normalizedNew || undefined,
+        changeType: current.changeType,
+        ranges: mergeRanges(current.ranges),
+        hunks: current.hunks,
+      });
+    }
+
+    current = null;
+  };
+
+  for (const line of lines) {
+    if (line.startsWith('diff --git ')) {
+      flushCurrent();
+      const m = /^diff --git (.+) (.+)$/.exec(line);
+      const oldPath = m ? normalizeDiffPath(m[1]) : '';
+      const newPath = m ? normalizeDiffPath(m[2]) : '';
+      current = {
+        filePath: newPath || oldPath,
+        oldPath: oldPath || undefined,
+        newPath: newPath || undefined,
+        changeType: 'Modified',
+        ranges: [],
+        hunks: [],
+      };
+      continue;
+    }
+
+    if (!current) continue;
+
+    if (line.startsWith('new file mode ')) {
+      current.changeType = 'Added';
+      continue;
+    }
+    if (line.startsWith('deleted file mode ')) {
+      current.changeType = 'Deleted';
+      continue;
+    }
+    if (line.startsWith('rename from ')) {
+      current.changeType = 'Renamed';
+      current.oldPath = normalizeDiffPath(line.slice('rename from '.length));
+      continue;
+    }
+    if (line.startsWith('rename to ')) {
+      current.changeType = 'Renamed';
+      current.newPath = normalizeDiffPath(line.slice('rename to '.length));
+      current.filePath = current.newPath || current.filePath;
+      continue;
+    }
+    if (line.startsWith('--- ')) {
+      const oldPath = normalizeDiffPath(line.slice(4));
+      if (oldPath) current.oldPath = oldPath;
+      continue;
+    }
+    if (line.startsWith('+++ ')) {
+      const newPath = normalizeDiffPath(line.slice(4));
+      if (newPath) {
+        current.newPath = newPath;
+        current.filePath = newPath;
+      }
+      continue;
+    }
+
+    const hunk = HUNK_HEADER_RE.exec(line);
+    if (!hunk) continue;
+
+    const oldStart = Number.parseInt(hunk[1], 10);
+    const oldCount = Number.parseInt(hunk[2] || '1', 10);
+    const newStart = Number.parseInt(hunk[3], 10);
+    const newCount = Number.parseInt(hunk[4] || '1', 10);
+
+    current.hunks.push({ oldStart, oldCount, newStart, newCount });
+
+    if (newCount > 0) {
+      current.ranges.push({ start: newStart, end: newStart + newCount - 1 });
+    } else if (oldCount > 0) {
+      // Pure deletion hunks have 0 new lines; map them to the nearest insertion anchor.
+      const anchor = Math.max(1, newStart);
+      current.ranges.push({ start: anchor, end: anchor });
+    }
+  }
+
+  flushCurrent();
+  return changes;
+}
+
 export interface CodebaseContext {
   projectName: string;
   stats: {
@@ -1035,25 +1206,27 @@ export class LocalBackend {
     let diffArgs: string[];
     switch (scope) {
       case 'staged':
-        diffArgs = ['diff', '--staged', '--name-only'];
+        diffArgs = ['diff', '--staged'];
         break;
       case 'all':
-        diffArgs = ['diff', 'HEAD', '--name-only'];
+        diffArgs = ['diff', 'HEAD'];
         break;
       case 'compare':
         if (!params.base_ref) return { error: 'base_ref is required for "compare" scope' };
-        diffArgs = ['diff', params.base_ref, '--name-only'];
+        diffArgs = ['diff', params.base_ref];
         break;
       case 'unstaged':
       default:
-        diffArgs = ['diff', '--name-only'];
+        diffArgs = ['diff'];
         break;
     }
 
-    let changedFiles: string[];
+    diffArgs.push('--unified=0', '--no-color', '--find-renames', '--relative');
+
+    let changedFiles: ChangedFileInfo[];
     try {
       const output = execFileSync('git', diffArgs, { cwd: repo.repoPath, encoding: 'utf-8' });
-      changedFiles = output.trim().split('\n').filter(f => f.length > 0);
+      changedFiles = parseDiffOutput(output);
     } catch (err: any) {
       return { error: `Git diff failed: ${err.message}` };
     }
@@ -1066,32 +1239,98 @@ export class LocalBackend {
       };
     }
     
-    // Map changed files to indexed symbols
-    const changedSymbols: any[] = [];
-    for (const file of changedFiles) {
-      const escaped = file.replace(/\\/g, '/').replace(/'/g, "''");
-      try {
-        const symbols = await executeQuery(repo.id, `
-          MATCH (n) WHERE n.filePath CONTAINS '${escaped}'
-          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
-          LIMIT 20
-        `);
+    // Map changed line ranges to indexed symbols (hunk-level precision)
+    const changedSymbolsMap = new Map<string, any>();
+
+    const pushChangedSymbol = (symbol: any) => {
+      const key = symbol.id || `UNINDEXED:${symbol.filePath}:${symbol.name}`;
+      if (!changedSymbolsMap.has(key)) {
+        changedSymbolsMap.set(key, symbol);
+        return;
+      }
+
+      const existing = changedSymbolsMap.get(key)!;
+      const mergedRanges = mergeRanges([...(existing.changed_ranges || []), ...(symbol.changed_ranges || [])]);
+      existing.changed_ranges = mergedRanges;
+      existing.hunk_count = Math.max(existing.hunk_count || 0, symbol.hunk_count || 0);
+      existing.change_type = existing.change_type === symbol.change_type ? existing.change_type : 'Modified';
+    };
+
+    for (const fileChange of changedFiles) {
+      const candidatePaths = new Set<string>([fileChange.filePath]);
+      if (fileChange.oldPath) candidatePaths.add(fileChange.oldPath);
+      if (fileChange.newPath) candidatePaths.add(fileChange.newPath);
+
+      let matchedSymbolInFile = false;
+
+      for (const candidatePath of candidatePaths) {
+        const escaped = candidatePath.replace(/'/g, "''");
+        let symbols: any[] = [];
+        try {
+          symbols = await executeQuery(repo.id, `
+            MATCH (n)
+            WHERE n.filePath = '${escaped}'
+            RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+          `);
+        } catch {
+          symbols = [];
+        }
+
         for (const sym of symbols) {
-          changedSymbols.push({
-            id: sym.id || sym[0],
-            name: sym.name || sym[1],
-            type: sym.type || sym[2],
-            filePath: sym.filePath || sym[3],
-            change_type: 'Modified',
+          const symId = sym.id || sym[0];
+          const symName = sym.name || sym[1];
+          const symType = sym.type || sym[2];
+          const symPath = sym.filePath || sym[3];
+          const startRaw = sym.startLine ?? sym[4];
+          const endRaw = sym.endLine ?? sym[5];
+          const startLine = Number(startRaw);
+          const endLine = Number(endRaw);
+          const hasLineSpan = Number.isFinite(startLine) && Number.isFinite(endLine);
+
+          const matchesHunk = hasLineSpan
+            ? rangesOverlap(startLine, endLine, fileChange.ranges)
+            : false;
+
+          if (!matchesHunk) continue;
+
+          matchedSymbolInFile = true;
+          pushChangedSymbol({
+            id: symId,
+            name: symName,
+            type: symType,
+            filePath: symPath,
+            startLine: hasLineSpan ? startLine : undefined,
+            endLine: hasLineSpan ? endLine : undefined,
+            change_type: fileChange.changeType,
+            changed_ranges: fileChange.ranges,
+            hunk_count: fileChange.hunks.length,
           });
         }
-      } catch { /* skip */ }
+      }
+
+      if (!matchedSymbolInFile) {
+        // Fallback: track file-level change (binary rename, line-less nodes, etc.)
+        const fileNodeId = `UNINDEXED:${fileChange.filePath}`;
+        pushChangedSymbol({
+          id: fileNodeId,
+          name: path.basename(fileChange.filePath),
+          type: 'File',
+          filePath: fileChange.filePath,
+          change_type: fileChange.changeType,
+          changed_ranges: fileChange.ranges,
+          hunk_count: fileChange.hunks.length,
+          indexed: false,
+        });
+      }
     }
+
+    const changedSymbols = Array.from(changedSymbolsMap.values());
     
     // Find affected processes
     const affectedProcesses = new Map<string, any>();
     for (const sym of changedSymbols) {
-      const escaped = (sym.id as string).replace(/'/g, "''");
+      if (!sym.id || String(sym.id).startsWith('UNINDEXED:')) continue;
+      const escaped = String(sym.id).replace(/'/g, "''");
       try {
         const procs = await executeQuery(repo.id, `
           MATCH (n {id: '${escaped}'})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
@@ -1111,6 +1350,7 @@ export class LocalBackend {
           affectedProcesses.get(pid)!.changed_steps.push({
             symbol: sym.name,
             step: proc.step || proc[4],
+            filePath: sym.filePath,
           });
         }
       } catch { /* skip */ }
@@ -1124,8 +1364,17 @@ export class LocalBackend {
         changed_count: changedSymbols.length,
         affected_count: processCount,
         changed_files: changedFiles.length,
+        changed_hunks: changedFiles.reduce((sum, f) => sum + f.hunks.length, 0),
         risk_level: risk,
       },
+      changed_file_hunks: changedFiles.map((f) => ({
+        filePath: f.filePath,
+        oldPath: f.oldPath,
+        newPath: f.newPath,
+        change_type: f.changeType,
+        hunk_count: f.hunks.length,
+        ranges: f.ranges,
+      })),
       changed_symbols: changedSymbols,
       affected_processes: Array.from(affectedProcesses.values()),
     };
