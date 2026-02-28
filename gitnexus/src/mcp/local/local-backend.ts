@@ -63,7 +63,8 @@ interface ChangedFileInfo {
   oldPath?: string;
   newPath?: string;
   changeType: ChangeType;
-  ranges: DiffLineRange[];
+  oldRanges: DiffLineRange[];
+  newRanges: DiffLineRange[];
   hunks: DiffHunk[];
 }
 
@@ -180,7 +181,8 @@ function parseDiffOutput(diffText: string): ChangedFileInfo[] {
         oldPath: normalizedOld || undefined,
         newPath: normalizedNew || undefined,
         changeType: current.changeType,
-        ranges: mergeRanges(current.ranges),
+        oldRanges: mergeRanges(current.oldRanges),
+        newRanges: mergeRanges(current.newRanges),
         hunks: current.hunks,
       });
     }
@@ -201,7 +203,8 @@ function parseDiffOutput(diffText: string): ChangedFileInfo[] {
         oldPath: oldPath || undefined,
         newPath: newPath || undefined,
         changeType: 'Modified',
-        ranges: [],
+        oldRanges: [],
+        newRanges: [],
         hunks: [],
       };
       continue;
@@ -252,12 +255,20 @@ function parseDiffOutput(diffText: string): ChangedFileInfo[] {
 
     current.hunks.push({ oldStart, oldCount, newStart, newCount });
 
+    if (oldCount > 0) {
+      current.oldRanges.push({ start: oldStart, end: oldStart + oldCount - 1 });
+    } else if (newCount > 0) {
+      // Pure insertion hunks have 0 old lines; use old-side anchor so index line numbers still match.
+      const oldAnchor = Math.max(1, oldStart);
+      current.oldRanges.push({ start: oldAnchor, end: oldAnchor });
+    }
+
     if (newCount > 0) {
-      current.ranges.push({ start: newStart, end: newStart + newCount - 1 });
+      current.newRanges.push({ start: newStart, end: newStart + newCount - 1 });
     } else if (oldCount > 0) {
-      // Pure deletion hunks have 0 new lines; map them to the nearest insertion anchor.
-      const anchor = Math.max(1, newStart);
-      current.ranges.push({ start: anchor, end: anchor });
+      // Pure deletion hunks have 0 new lines; keep a new-side anchor for UI/debug output.
+      const newAnchor = Math.max(1, newStart);
+      current.newRanges.push({ start: newAnchor, end: newAnchor });
     }
   }
 
@@ -1336,9 +1347,10 @@ export class LocalBackend {
           const startLine = Number(startRaw);
           const endLine = Number(endRaw);
           const hasLineSpan = Number.isFinite(startLine) && Number.isFinite(endLine);
+          const matchRanges = fileChange.oldRanges.length > 0 ? fileChange.oldRanges : fileChange.newRanges;
 
           const matchesHunk = hasLineSpan
-            ? rangesOverlap(startLine, endLine, fileChange.ranges)
+            ? rangesOverlap(startLine, endLine, matchRanges)
             : false;
 
           if (!matchesHunk) continue;
@@ -1352,7 +1364,8 @@ export class LocalBackend {
             startLine: hasLineSpan ? startLine : undefined,
             endLine: hasLineSpan ? endLine : undefined,
             change_type: fileChange.changeType,
-            changed_ranges: fileChange.ranges,
+            changed_ranges: matchRanges,
+            changed_new_ranges: fileChange.newRanges,
             hunk_count: fileChange.hunks.length,
           });
         }
@@ -1367,7 +1380,8 @@ export class LocalBackend {
           type: 'File',
           filePath: fileChange.filePath,
           change_type: fileChange.changeType,
-          changed_ranges: fileChange.ranges,
+          changed_ranges: fileChange.oldRanges,
+          changed_new_ranges: fileChange.newRanges,
           hunk_count: fileChange.hunks.length,
           indexed: false,
         });
@@ -1423,7 +1437,9 @@ export class LocalBackend {
         newPath: f.newPath,
         change_type: f.changeType,
         hunk_count: f.hunks.length,
-        ranges: f.ranges,
+        ranges: f.oldRanges,
+        old_ranges: f.oldRanges,
+        new_ranges: f.newRanges,
       })),
       changed_symbols: changedSymbols,
       affected_processes: Array.from(affectedProcesses.values()),
