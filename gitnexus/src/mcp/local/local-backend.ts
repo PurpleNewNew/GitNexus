@@ -331,42 +331,75 @@ export class LocalBackend {
     const processLimit = params.limit || 5;
     const maxSymbolsPerProcess = params.max_symbols || 10;
     const includeContent = params.include_content ?? false;
-    const searchQuery = params.query.trim();
-    
-    // Step 1: Run hybrid search to get matching symbols
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
-    const [bm25Results, semanticResults] = await Promise.all([
-      this.bm25Search(repo, searchQuery, searchLimit),
-      this.semanticSearch(repo, searchQuery, searchLimit),
-    ]);
-    
-    // Merge via reciprocal rank fusion
+
+    type QuerySignal = {
+      text: string;
+      weight: number;
+      source: 'query' | 'goal' | 'task_context';
+    };
+
+    // Multi-signal retrieval:
+    // - query: primary intent (highest weight)
+    // - goal: desired outcome (medium weight)
+    // - task_context: surrounding task details (lower weight)
+    const candidateSignals: QuerySignal[] = [
+      { text: params.query.trim(), weight: 1.0, source: 'query' },
+      ...(params.goal?.trim() ? [{ text: params.goal.trim(), weight: 0.75, source: 'goal' as const }] : []),
+      ...(params.task_context?.trim() ? [{ text: params.task_context.trim(), weight: 0.45, source: 'task_context' as const }] : []),
+    ];
+
+    // Deduplicate identical signal texts while preserving strongest weight.
+    const signalMap = new Map<string, QuerySignal>();
+    for (const signal of candidateSignals) {
+      const key = signal.text.toLowerCase();
+      const existing = signalMap.get(key);
+      if (!existing || signal.weight > existing.weight) {
+        signalMap.set(key, signal);
+      }
+    }
+    const signals = Array.from(signalMap.values());
+
+    const signalResults = await Promise.all(
+      signals.map(async (signal) => {
+        const [bm25Results, semanticResults] = await Promise.all([
+          this.bm25Search(repo, signal.text, searchLimit),
+          this.semanticSearch(repo, signal.text, searchLimit),
+        ]);
+        return { signal, bm25Results, semanticResults };
+      })
+    );
+
+    // Merge via weighted reciprocal rank fusion (wRRF)
+    const RRF_K = 60;
     const scoreMap = new Map<string, { score: number; data: any }>();
-    
-    for (let i = 0; i < bm25Results.length; i++) {
-      const result = bm25Results[i];
-      const key = result.nodeId || result.filePath;
-      const rrfScore = 1 / (60 + i);
-      const existing = scoreMap.get(key);
-      if (existing) {
-        existing.score += rrfScore;
-      } else {
-        scoreMap.set(key, { score: rrfScore, data: result });
+
+    for (const { signal, bm25Results, semanticResults } of signalResults) {
+      for (let i = 0; i < bm25Results.length; i++) {
+        const result = bm25Results[i];
+        const key = result.nodeId || result.filePath;
+        const rrfScore = signal.weight / (RRF_K + i + 1);
+        const existing = scoreMap.get(key);
+        if (existing) {
+          existing.score += rrfScore;
+        } else {
+          scoreMap.set(key, { score: rrfScore, data: result });
+        }
+      }
+
+      for (let i = 0; i < semanticResults.length; i++) {
+        const result = semanticResults[i];
+        const key = result.nodeId || result.filePath;
+        const rrfScore = signal.weight / (RRF_K + i + 1);
+        const existing = scoreMap.get(key);
+        if (existing) {
+          existing.score += rrfScore;
+        } else {
+          scoreMap.set(key, { score: rrfScore, data: result });
+        }
       }
     }
-    
-    for (let i = 0; i < semanticResults.length; i++) {
-      const result = semanticResults[i];
-      const key = result.nodeId || result.filePath;
-      const rrfScore = 1 / (60 + i);
-      const existing = scoreMap.get(key);
-      if (existing) {
-        existing.score += rrfScore;
-      } else {
-        scoreMap.set(key, { score: rrfScore, data: result });
-      }
-    }
-    
+
     const merged = Array.from(scoreMap.entries())
       .sort((a, b) => b[1].score - a[1].score)
       .slice(0, searchLimit);
