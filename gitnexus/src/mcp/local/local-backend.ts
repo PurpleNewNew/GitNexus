@@ -68,15 +68,63 @@ interface ChangedFileInfo {
 }
 
 const HUNK_HEADER_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+const DIFF_GIT_HEADER_RE = /^diff --git (?:"((?:\\.|[^"])*)"|(\S+)) (?:"((?:\\.|[^"])*)"|(\S+))$/;
+
+function decodeGitQuotedPath(value: string): string {
+  let out = '';
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch !== '\\') {
+      out += ch;
+      continue;
+    }
+
+    i += 1;
+    if (i >= value.length) {
+      out += '\\';
+      break;
+    }
+
+    const esc = value[i];
+    switch (esc) {
+      case 'n':
+        out += '\n';
+        break;
+      case 'r':
+        out += '\r';
+        break;
+      case 't':
+        out += '\t';
+        break;
+      case '"':
+        out += '"';
+        break;
+      case '\\':
+        out += '\\';
+        break;
+      default: {
+        // Git may emit octal escapes in quoted paths.
+        if (/[0-7]/.test(esc)) {
+          let oct = esc;
+          for (let j = 0; j < 2 && i + 1 < value.length && /[0-7]/.test(value[i + 1]); j++) {
+            oct += value[++i];
+          }
+          out += String.fromCharCode(Number.parseInt(oct, 8));
+        } else {
+          out += esc;
+        }
+      }
+    }
+  }
+  return out;
+}
 
 function normalizeDiffPath(rawPath: string): string {
   let p = rawPath.trim();
   if (!p || p === '/dev/null') return '';
 
   if ((p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
-    p = p.slice(1, -1)
-      .replace(/\\"/g, '"')
-      .replace(/\\\\/g, '\\');
+    p = decodeGitQuotedPath(p.slice(1, -1));
   }
 
   if (p.startsWith('a/') || p.startsWith('b/')) {
@@ -143,9 +191,11 @@ function parseDiffOutput(diffText: string): ChangedFileInfo[] {
   for (const line of lines) {
     if (line.startsWith('diff --git ')) {
       flushCurrent();
-      const m = /^diff --git (.+) (.+)$/.exec(line);
-      const oldPath = m ? normalizeDiffPath(m[1]) : '';
-      const newPath = m ? normalizeDiffPath(m[2]) : '';
+      const m = DIFF_GIT_HEADER_RE.exec(line);
+      const oldRaw = m ? (m[1] !== undefined ? decodeGitQuotedPath(m[1]) : (m[2] || '')) : '';
+      const newRaw = m ? (m[3] !== undefined ? decodeGitQuotedPath(m[3]) : (m[4] || '')) : '';
+      const oldPath = normalizeDiffPath(oldRaw);
+      const newPath = normalizeDiffPath(newRaw);
       current = {
         filePath: newPath || oldPath,
         oldPath: oldPath || undefined,
